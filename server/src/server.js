@@ -1018,6 +1018,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(process.env.PORT || 4000, () => {
-  console.log(`ScholarPro API running on ${process.env.PORT || 4000} (${demo ? "demo" : "postgres"} mode)`);
-});
+if (process.env.VERCEL !== "1") {
+  app.listen(process.env.PORT || 4000, () => {
+    console.log(`ScholarPro API running on ${process.env.PORT || 4000} (${demo ? "demo" : "postgres"} mode)`);
+  });
+}
+
+export default app;
