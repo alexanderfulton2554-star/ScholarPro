@@ -20,15 +20,8 @@ app.use(express.json({ limit: "10mb" }));
 
 const demo = !process.env.DATABASE_URL;
 const mem = {
-  users: [
-    { id: "demo-student", name: "Demo Student", email: "student@scholarpro.test", passwordHash: bcrypt.hashSync("Student123!", 10), role: "student", status: "active", writerMode: null, referralCode: null },
-    { id: "demo-writer", name: "Demo Writer", email: "writer@scholarpro.test", passwordHash: bcrypt.hashSync("Writer123!", 10), role: "writer", status: "active", writerMode: "public", referralCode: "WRITER-DEMO" },
-    { id: "demo-admin", name: "Demo Admin", email: "admin@scholarpro.test", passwordHash: bcrypt.hashSync("Admin123!", 10), role: "admin", status: "active", writerMode: null, referralCode: null }
-  ],
-  wallets: {
-    "demo-student": { registrationCredit: 300, pendingEarnings: 0, withdrawableBalance: 0, totalWithdrawn: 0 },
-    "demo-writer": { registrationCredit: 300, pendingEarnings: 0, withdrawableBalance: 0, totalWithdrawn: 0 }
-  },
+  users: [],
+  wallets: {},
   tasks: [],
   notifications: [],
   referrals: []
@@ -159,33 +152,6 @@ function formatDate(dateValue) {
 
 async function ensureDefaultAccounts() {
   if (demo) return;
-
-  const defaultUsers = [
-    { name: "Demo Student", email: "student@scholarpro.test", passwordHash: bcrypt.hashSync("Student123!", 10), role: "student", status: "active", writerMode: null, referralCode: null },
-    { name: "Demo Writer", email: "writer@scholarpro.test", passwordHash: bcrypt.hashSync("Writer123!", 10), role: "writer", status: "active", writerMode: "public", referralCode: "WRITER-DEMO" },
-    { name: "Demo Admin", email: "admin@scholarpro.test", passwordHash: bcrypt.hashSync("Admin123!", 10), role: "admin", status: "active", writerMode: null, referralCode: null }
-  ];
-
-  for (const user of defaultUsers) {
-    const existing = await findUserByEmail(user.email);
-    if (existing) {
-      if (user.referralCode && !existing.referral_code && !existing.referralCode) {
-        await q("UPDATE users SET referral_code=$1 WHERE id=$2", [user.referralCode, existing.id]);
-      }
-      continue;
-    }
-
-    const uid = id();
-    await q(
-      "INSERT INTO users(id, name, email, password_hash, role, status, writer_mode, referral_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
-      [uid, user.name, user.email, user.passwordHash, user.role, user.status, user.writerMode, user.referralCode]
-    );
-
-    await q(
-      "INSERT INTO wallets(user_id, registration_credit) VALUES($1, $2)",
-      [uid, user.role === "student" || user.role === "writer" ? 300 : 0]
-    );
-  }
 }
 
 app.get("/api/health", (req, res) => {

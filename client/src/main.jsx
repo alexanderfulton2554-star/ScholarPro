@@ -140,15 +140,6 @@ function Auth({ onLogin }) {
             ? "Create a new account"
             : "Already have an account? Login"}
         </button>
-        <div className="demo">
-          Demo credentials:
-          <br />
-          Admin: admin@scholarpro.test / Admin123!
-          <br />
-          Writer: writer@scholarpro.test / Writer123!
-          <br />
-          Student: student@scholarpro.test / Student123!
-        </div>
       </div>
     </div>
   );
