@@ -26,7 +26,7 @@ API: http://localhost:4000
 The application runs without PostgreSQL in demo mode if DATABASE_URL is not configured. Demo data is stored in memory and is intended only for UI/testing. Configure PostgreSQL before production use.
 
 ## Payment
-M-Pesa is intentionally represented by a server-side payment service boundary. Add real Daraja credentials and callback verification before production. Never mark a payment successful from the browser alone.
+ZetuPay is configured as a server-side payment boundary. Add real ZetuPay credentials and webhook verification before production. Never expose the secret key in the browser or commit it to version control.
 
 ## Wallet rule
 A verified KSh 300 registration payment creates KSh 300 non-withdrawable platform credit. Withdrawals use only `withdrawable_balance`, which is never populated from registration credit.

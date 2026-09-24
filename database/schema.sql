@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id),
   amount NUMERIC(12,2) NOT NULL,
+  mpesa_number VARCHAR(20) NOT NULL,
   status VARCHAR(30) NOT NULL DEFAULT 'pending',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS mpesa_number VARCHAR(20);

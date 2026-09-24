@@ -1,5 +1,6 @@
 ﻿import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { normalizePhoneNumberForZetuPay, savePendingZetuPayPayment, verifyPendingZetuPayPayment } from "./paymentFlow.js";
 import {
   LayoutDashboard,
   WalletCards,
@@ -23,7 +24,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
+const API = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? "/api" : "http://localhost:4000/api");
 
 const api = async (path, opts = {}) => {
   const token = localStorage.getItem("sp_token");
@@ -63,19 +64,21 @@ function Auth({ onLogin }) {
         body: JSON.stringify({ ...form, role: form.role || "writer" })
       });
 
-      const d = await api("/auth/login", {
-        method: "POST",
-        body: JSON.stringify({
-          email: form.email,
-          password: form.password
-        })
-      });
+      const createdMessage = created.message || (
+        (form.role || "writer") === "student"
+          ? "Account created. Your account is pending admin approval."
+          : "Account created. Log in and pay KSh 300 to activate your writer profile."
+      );
 
-      localStorage.setItem("sp_token", d.token);
-      onLogin(d.user);
-      setMsg("");
+      setMsg(createdMessage);
       setMode("login");
-      setForm({ role: "writer" });
+      setForm({
+        email: form.email,
+        password: "",
+        role: form.role || "writer",
+        referralCode: form.referralCode || ""
+      });
+      return;
     } catch (e) {
       setMsg(e.message);
     }
@@ -155,7 +158,7 @@ function WriterModeSelection({ onPublic, onPrivate }) {
           <h1>Choose Your Writer Profile</h1>
           <p className="modeSelectionSubtitle">Select how you would like to work with ScholarPro.</p>
           <div className="paymentNotice">
-            <strong>Registration of ksh. 300. Can be withdrawn after first assignment</strong>
+            <strong>Public writer: KSh 200 • Private writer: KSh 300</strong>
           </div>
         </div>
 
@@ -182,7 +185,7 @@ function WriterModeSelection({ onPublic, onPrivate }) {
             </ul>
             
             <button onClick={onPublic} className="modeContinueBtn public">
-              Continue & Confirm Payment (KSh 300)
+              Continue & Confirm Payment (KSh 200)
             </button>
           </div>
 
@@ -201,9 +204,9 @@ function WriterModeSelection({ onPublic, onPrivate }) {
               <li>Profile hidden from students</li>
               <li>Private working environment</li>
               <li>No public profile</li>
-              <li>Direct Admin assignments</li>
+              <li>Tasks or assignments assigned by direct clients</li>
               <li>Your personal information stays private</li>
-              <li>Tasks are assigned by Admin only</li>
+              <li>Work through direct client booking</li>
             </ul>
             
             <button onClick={onPrivate} className="modeContinueBtn private">
@@ -232,6 +235,62 @@ const readFiles = (files) => Promise.all(Array.from(files).map((file) => new Pro
   reader.onerror = reject;
   reader.readAsDataURL(file);
 })));
+
+async function initiateZetuPayPayment({ amount, phoneNumber, reference, writerMode, checkoutWindow }) {
+  try {
+    const config = await api("/payments/zetupay/config");
+    if (!config?.isConfigured) {
+      return { fallback: true, reason: "No ZetuPay keys configured on the backend." };
+    }
+
+    const response = await api("/payments/zetupay", {
+      method: "POST",
+      body: JSON.stringify({
+        amount,
+        phoneNumber,
+        reference,
+        writerMode,
+        redirectUrl: `${window.location.origin}/payment/success`,
+        currency: "KES",
+        real: false
+      })
+    });
+    const paymentData = response?.data || response;
+
+    const paymentUrl = paymentData?.checkoutUrl || paymentData?.url || paymentData?.redirectUrl;
+
+    if (paymentUrl) {
+      if (checkoutWindow && !checkoutWindow.closed) {
+        checkoutWindow.location.href = paymentUrl;
+      } else if (window.open) {
+        const fallbackWindow = window.open(paymentUrl, "_blank", "noopener,noreferrer");
+        if (fallbackWindow) {
+          return { fallback: false, redirected: true, url: paymentUrl };
+        }
+        window.location.assign(paymentUrl);
+      } else {
+        window.location.assign(paymentUrl);
+      }
+      return { fallback: false, redirected: true, url: paymentUrl };
+    }
+
+    return { fallback: false, redirected: false, response };
+  } catch (error) {
+    return { fallback: true, reason: error.message };
+  }
+}
+
+function PaymentSuccessState({ onContinue }) {
+  return (
+    <div className="authShell">
+      <div className="authCard">
+        <h1>Payment Submitted</h1>
+        <p className="muted">Your payment has been submitted for confirmation. You may return to ScholarPro while ZetuPay completes processing.</p>
+        <button onClick={onContinue}>Return to ScholarPro</button>
+      </div>
+    </div>
+  );
+}
 
 function TaskCard({ task, onAssign, onApprove, onReject, onSubmit, userRole }) {
   const [submitting, setSubmitting] = useState(false);
@@ -461,12 +520,38 @@ function TaskCard({ task, onAssign, onApprove, onReject, onSubmit, userRole }) {
 }
 
 function App() {
+  const isPaymentSuccessRoute = window.location.pathname === "/payment/success";
+
+  useEffect(() => {
+    if (isPaymentSuccessRoute) {
+      verifyPendingZetuPayPayment(api).then((result) => {
+        if (result?.paid) {
+          localStorage.setItem("sp_payment_confirmed", "true");
+        }
+      }).catch(() => {});
+    }
+  }, [isPaymentSuccessRoute]);
+
+  if (isPaymentSuccessRoute) {
+    return (
+      <PaymentSuccessState
+        onContinue={() => {
+          window.history.pushState({}, "", "/");
+          window.location.reload();
+        }}
+      />
+    );
+  }
+
   const [user, setUser] = useState(null);
   const [me, setMe] = useState(null);
   const [tab, setTab] = useState("dashboard");
   const [writerTab, setWriterTab] = useState("dashboard");
   const [adminTab, setAdminTab] = useState("overview");
   const [showWriterModeSelect, setShowWriterModeSelect] = useState(false);
+  const [showMpesaPromptModal, setShowMpesaPromptModal] = useState(false);
+  const [pendingWriterPaymentMode, setPendingWriterPaymentMode] = useState(null);
+  const [paymentPhoneForm, setPaymentPhoneForm] = useState({ phoneNumber: "" });
   const [tasks, setTasks] = useState([]);
   const [assignedTasks, setAssignedTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
@@ -525,6 +610,13 @@ function App() {
     try {
       const m = await api("/me");
       setMe(m);
+
+      if (m.user.status === "pending") {
+        if (m.user.role === "writer") {
+          setShowWriterModeSelect(true);
+        }
+        return;
+      }
       
       // Show writer mode selection if writer hasn't selected yet
       if (m.user.role === "writer" && !m.user.writerMode) {
@@ -568,23 +660,46 @@ function App() {
     if (localStorage.getItem("sp_token")) load();
   }, []);
 
-  const setWriterMode = async (mode) => {
+  const setWriterMode = async (mode, phoneInput = "") => {
     try {
-      // Set writer mode
-      await api("/writer/mode", {
-        method: "POST",
-        body: JSON.stringify({ mode })
+      const fee = mode === "public" ? 200 : 300;
+      const rawPhone = (phoneInput || "").trim();
+      if (!rawPhone) {
+        setError("M-Pesa phone number is required to continue with writer registration payment.");
+        return;
+      }
+
+      const phoneNumber = normalizePhoneNumberForZetuPay(rawPhone);
+      if (!phoneNumber || !/^\+254\d{9}$/.test(phoneNumber)) {
+        setError("Please enter a valid M-Pesa phone number before continuing.");
+        return;
+      }
+
+      const checkoutWindow = window.open("", "_blank", "noopener,noreferrer");
+      const reference = `WRITER-${mode.toUpperCase()}-${Date.now()}`;
+      savePendingZetuPayPayment({ reference, amount: fee, writerMode: mode });
+
+      const payment = await initiateZetuPayPayment({
+        amount: fee,
+        phoneNumber,
+        reference,
+        writerMode: mode,
+        checkoutWindow
       });
-      
-      // Confirm registration payment (KSh 300)
-      await api("/payments/registration/demo-confirm", {
-        method: "POST",
-        body: JSON.stringify({ amount: 300 })
-      });
-      
+
+      if (payment.fallback) {
+        setError(payment.reason || "Payment request failed. Please check your ZetuPay configuration and try again.");
+        return;
+      }
+
+      if (payment.redirected) {
+        setSuccess("Payment request created. Complete the secure ZetuPay checkout on your phone. Your writer profile will activate only after payment confirmation.");
+        return;
+      }
+
       setShowWriterModeSelect(false);
       await load();
-      setSuccess(`Writer profile set to ${mode === "public" ? "PUBLIC" : "PRIVATE"} mode. Registration payment confirmed!`);
+      setSuccess(`Writer profile set to ${mode === "public" ? "PUBLIC" : "PRIVATE"} mode.`);
     } catch (e) {
       setError(e.message);
     }
@@ -593,11 +708,40 @@ function App() {
   if (!user && !localStorage.getItem("sp_token"))
     return <Auth onLogin={(u) => { setUser(u); load(); }} />;
   if (!me) return <div className="loading">Loading ScholarPro…</div>;
+
+  if (me.user.status === "pending") {
+    if (me.user.role === "writer") {
+      return <WriterModeSelection
+        onPublic={() => setWriterMode("public")}
+        onPrivate={() => setWriterMode("private")}
+      />;
+    }
+
+    return (
+      <div className="authShell">
+        <div className="authCard">
+          <h1>Account Pending</h1>
+          <p className="muted">Your account is still waiting for approval or registration payment confirmation.</p>
+          <button onClick={() => {
+            localStorage.removeItem("sp_token");
+            setUser(null);
+            setMe(null);
+          }}>Log out</button>
+        </div>
+      </div>
+    );
+  }
   
+  const openWriterPaymentPrompt = (mode) => {
+    setPendingWriterPaymentMode(mode);
+    setPaymentPhoneForm({ phoneNumber: "" });
+    setShowMpesaPromptModal(true);
+  };
+
   if (showWriterModeSelect) {
     return <WriterModeSelection 
-      onPublic={() => setWriterMode("public")} 
-      onPrivate={() => setWriterMode("private")} 
+      onPublic={() => openWriterPaymentPrompt("public")} 
+      onPrivate={() => openWriterPaymentPrompt("private")} 
     />;
   }
 
@@ -610,12 +754,43 @@ function App() {
     setMe(null);
   };
 
-  const confirmPayment = async () => {
+  const confirmPayment = async (phoneInput = "") => {
     try {
-      await api("/payments/registration/demo-confirm", {
-        method: "POST",
-        body: JSON.stringify({ amount: 300 })
+      const rawPhone = (phoneInput || "").trim();
+      if (!rawPhone) {
+        setError("M-Pesa phone number is required to continue with registration payment.");
+        return;
+      }
+
+      const phoneNumber = normalizePhoneNumberForZetuPay(rawPhone);
+      if (!phoneNumber || !/^\+254\d{9}$/.test(phoneNumber)) {
+        setError("Please enter a valid M-Pesa phone number before continuing.");
+        return;
+      }
+
+      const amount = 300;
+      const reference = `REG-${Date.now()}`;
+      savePendingZetuPayPayment({ reference, amount, writerMode: "private" });
+
+      const checkoutWindow = window.open("", "_blank", "noopener,noreferrer");
+      const payment = await initiateZetuPayPayment({
+        amount,
+        phoneNumber,
+        reference,
+        writerMode: "private",
+        checkoutWindow
       });
+
+      if (payment.fallback) {
+        setError(payment.reason || "Registration payment could not be initiated. Please try again.");
+        return;
+      }
+
+      if (payment.redirected) {
+        setSuccess("Payment request created. Complete the secure ZetuPay checkout on your phone to activate your account.");
+        return;
+      }
+
       await load();
       setSuccess("Payment confirmed!");
     } catch (e) {
@@ -1156,7 +1331,11 @@ function App() {
                       <div>
                         <strong>Confirmation Required</strong>
                         <p>Complete KSh 300 registration payment</p>
-                        <button onClick={confirmPayment} className="actionBtn">
+                        <button onClick={() => {
+                          setPendingWriterPaymentMode("private");
+                          setPaymentPhoneForm({ phoneNumber: "" });
+                          setShowMpesaPromptModal(true);
+                        }} className="actionBtn">
                           Confirm Payment
                         </button>
                       </div>
@@ -1851,6 +2030,19 @@ function AdminDashboard({
   const [selectedWriter, setSelectedWriter] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
   const [assignmentForm, setAssignmentForm] = useState({ writerId: "", deadline: "" });
+
+  const updateStudentStatus = async (student, status) => {
+    try {
+      await api(`/admin/student/${student.id}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status })
+      });
+      setSuccess(`Student ${status === "active" ? "approved" : status}.`);
+      window.location.reload();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
   const [submitting, setSubmitting] = useState(false);
   const [selectedClient, setSelectedClient] = useState(null);
   const [showBanModal, setShowBanModal] = useState(false);
@@ -2437,7 +2629,14 @@ function AdminDashboard({
                       </td>
                       <td>{student.ordersCreated || 0}</td>
                       <td>
-                        {student.status === "active" ? (
+                        {student.status === "pending" ? (
+                          <button
+                            onClick={() => updateStudentStatus(student, "active")}
+                            style={{ fontSize: "12px", padding: "6px 10px", background: "#ecfdf3", color: "#027a48", border: "none", borderRadius: "6px", cursor: "pointer" }}
+                          >
+                            Approve
+                          </button>
+                        ) : student.status === "active" ? (
                           <button 
                             onClick={() => {
                               setSelectedClient(student);
@@ -2448,7 +2647,7 @@ function AdminDashboard({
                             Ban Client
                           </button>
                         ) : (
-                          <span style={{ fontSize: "12px", color: "#98a2b3" }}>Banned</span>
+                          <span style={{ fontSize: "12px", color: "#98a2b3" }}>{student.status}</span>
                         )}
                       </td>
                     </tr>
@@ -2766,6 +2965,38 @@ function WriterProfileModals({
             <div className="modalActions">
               <button onClick={handleChangePassword}>Change Password</button>
               <button className="secondary" onClick={() => setShowPasswordModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showMpesaPromptModal && (
+        <div className="modal" onClick={() => setShowMpesaPromptModal(false)}>
+          <div className="modalContent" onClick={(e) => e.stopPropagation()}>
+            <h3>Enter M-Pesa Number</h3>
+            <p className="muted" style={{ marginTop: "10px", marginBottom: "16px" }}>
+              Enter the phone number to use for the {pendingWriterPaymentMode === "public" ? "public writer" : "private writer"} registration payment.
+            </p>
+            <input
+              type="tel"
+              placeholder="M-Pesa phone number (e.g. 0712345678)"
+              value={paymentPhoneForm.phoneNumber}
+              onChange={(e) => setPaymentPhoneForm({ phoneNumber: e.target.value })}
+              style={{ marginBottom: "16px" }}
+            />
+            <div className="modalActions">
+              <button onClick={async () => {
+                const nextPhone = paymentPhoneForm.phoneNumber;
+                setShowMpesaPromptModal(false);
+
+                if (pendingWriterPaymentMode === "private" && me?.user?.status === "pending") {
+                  await confirmPayment(nextPhone);
+                  return;
+                }
+
+                await setWriterMode(pendingWriterPaymentMode, nextPhone);
+              }}>Continue to Payment</button>
+              <button className="secondary" onClick={() => setShowMpesaPromptModal(false)}>Cancel</button>
             </div>
           </div>
         </div>

@@ -8,45 +8,109 @@ import crypto from "crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const moduleDirectory = typeof __dirname === "string"
+  ? __dirname
+  : path.dirname(fileURLToPath(import.meta.url));
 
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
+dotenv.config({ path: path.resolve(moduleDirectory, "../.env") });
 dotenv.config();
 
+const ZETUPAY_BASE_URL = (process.env.ZETUPAY_BASE_URL || "https://pay.zetupay.co.ke").replace(/\/+$/, "");
+const ZETUPAY_SECRET_KEY = process.env.ZETUPAY_SECRET_KEY || "";
+const ZETUPAY_PUBLIC_KEY = process.env.ZETUPAY_PUBLIC_KEY || "";
+const ZETUPAY_WEBHOOK_SECRET = process.env.ZETUPAY_WEBHOOK_SECRET || ZETUPAY_SECRET_KEY;
+const ZETUPAY_PAYMENT_INIT_URL = ZETUPAY_BASE_URL.endsWith("/api/v1")
+  ? `${ZETUPAY_BASE_URL}/payment/initiate`
+  : `${ZETUPAY_BASE_URL}/api/v1/payment/initiate`;
+const zetupayTransactions = new Map();
+const pendingWriterPayments = new Map();
+
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || "http://localhost:5173" }));
+const databaseUrl = process.env.DATABASE_URL || "";
+const isSqliteDatabase = databaseUrl.startsWith("sqlite:");
+const demo = !databaseUrl || isSqliteDatabase;
+const allowedOrigins = [
+  ...(process.env.CORS_ORIGIN || "").split(",").map((origin) => origin.trim()).filter(Boolean),
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:5175",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:5174",
+  "http://127.0.0.1:5175"
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+
+    const isAllowed = allowedOrigins.includes(origin) || /^http:\/\/localhost:\d+$/.test(origin) || /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
+    if (isAllowed) return callback(null, true);
+
+    callback(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true
+};
+
+app.use(cors(corsOptions));
 app.use(express.json({ limit: "10mb" }));
 
-const demo = !process.env.DATABASE_URL;
 const mem = {
   users: [],
   wallets: {},
   tasks: [],
   notifications: [],
-  referrals: []
+  referrals: [],
+  withdrawals: []
 };
 
 let pool;
 if (!demo) {
   pool = new pg.Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+    connectionString: databaseUrl,
+    ssl: databaseUrl.includes("localhost") ? false : { rejectUnauthorized: false }
   });
 }
 
 const id = () => crypto.randomUUID();
 const sign = (u) => jwt.sign({ id: u.id, role: u.role, email: u.email }, process.env.JWT_SECRET || "demo-secret", { expiresIn: "7d" });
 
+if (demo && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD_HASH) {
+  mem.users.push({
+    id: id(),
+    name: "Administrator",
+    email: process.env.ADMIN_EMAIL.toLowerCase(),
+    passwordHash: process.env.ADMIN_PASSWORD_HASH,
+    role: "admin",
+    status: "active",
+    writerMode: null,
+    referralCode: null
+  });
+}
+
 async function q(text, params = []) {
   if (!pool) return [];
   return (await pool.query(text, params)).rows;
 }
 
-function auth(req, res, next) {
+async function auth(req, res, next) {
   const header = req.headers.authorization || "";
   try {
-    req.user = jwt.verify(header.replace("Bearer ", ""), process.env.JWT_SECRET || "demo-secret");
+    const verified = jwt.verify(header.replace("Bearer ", ""), process.env.JWT_SECRET || "demo-secret");
+    req.user = verified;
+
+    const user = await findUserById(verified.id);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    if (user.status === "banned") {
+      return res.status(403).json({ error: "Your account has been banned from the platform." });
+    }
+
+    if (user.status === "pending") {
+      return res.status(403).json({ error: "Your account is pending approval or registration payment." });
+    }
+
     next();
   } catch {
     res.status(401).json({ error: "Authentication required" });
@@ -158,6 +222,182 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, service: "ScholarPro API", demoMode: demo });
 });
 
+app.get("/api/payments/zetupay/config", (req, res) => {
+  res.json({
+    success: true,
+    mode: process.env.ZETUPAY_ENV || "sandbox",
+    publicKey: ZETUPAY_PUBLIC_KEY || null,
+    isConfigured: Boolean(ZETUPAY_SECRET_KEY && ZETUPAY_PUBLIC_KEY)
+  });
+});
+
+app.post("/api/payments/zetupay", async (req, res) => {
+  try {
+    const {
+      amount,
+      phoneNumber,
+      reference,
+      redirectUrl,
+      currency = "KES",
+      identifier,
+      real = false,
+      writerMode
+    } = req.body || {};
+
+    if (!ZETUPAY_SECRET_KEY) {
+      return res.status(400).json({
+        success: false,
+        message: "ZetuPay secret key is not configured on the backend."
+      });
+    }
+
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid amount is required."
+      });
+    }
+
+    if (!reference) {
+      return res.status(400).json({
+        success: false,
+        message: "A payment reference is required."
+      });
+    }
+
+    const isTestMode = String(process.env.ZETUPAY_TEST_MODE ?? "true").toLowerCase() !== "false";
+    const payload = {
+      amount: numericAmount,
+      reference,
+      redirectUrl: redirectUrl || process.env.ZETUPAY_REDIRECT_URL || "http://localhost:5173/payment/success",
+      currency,
+      real: isTestMode ? false : true
+    };
+
+    if (phoneNumber) payload.phoneNumber = phoneNumber;
+    if (identifier) payload.identifier = identifier;
+
+    const response = await fetch(ZETUPAY_PAYMENT_INIT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ZETUPAY_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        success: false,
+        message: data.message || data.error || "ZetuPay payment initiation failed.",
+        data
+      });
+    }
+
+    if (writerMode && ["public", "private"].includes(writerMode)) {
+      try {
+        const token = (req.headers.authorization || "").replace("Bearer ", "");
+        const paymentUser = jwt.verify(token, process.env.JWT_SECRET || "demo-secret");
+        pendingWriterPayments.set(reference, { userId: paymentUser.id, mode: writerMode, amount: numericAmount });
+      } catch {
+        return res.status(401).json({ success: false, message: "Authentication required for writer registration payment." });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      ...data,
+      reference,
+      mode: process.env.ZETUPAY_ENV || "sandbox"
+    });
+  } catch (error) {
+    console.error("ZetuPay initiation error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Payment initiation failed."
+    });
+  }
+});
+
+app.post("/api/webhooks/zetupay", async (req, res) => {
+  const secret = req.headers["x-zetupay-secret"];
+  if (!ZETUPAY_WEBHOOK_SECRET || secret !== ZETUPAY_WEBHOOK_SECRET) {
+    return res.status(401).json({ success: false, message: "Invalid webhook signature." });
+  }
+
+  const event = req.body?.event || "unknown";
+  const data = req.body?.data || req.body || {};
+  const reference = data.reference || data.ref || data.referenceNumber || null;
+  const transactionId = data.transactionId || data.waveTransactionId || data.id || null;
+  const amount = Number(data.amount || 0);
+
+  if (reference) {
+    const pendingWriterPayment = pendingWriterPayments.get(reference);
+    const isPaid = event.toLowerCase().includes("success");
+    zetupayTransactions.set(reference, {
+      status: isPaid ? "paid" : "pending",
+      transactionId,
+      amount,
+      event,
+      receivedAt: new Date().toISOString()
+    });
+
+    if (isPaid && pendingWriterPayment) {
+      if (demo) {
+        const user = mem.users.find((item) => item.id === pendingWriterPayment.userId);
+        const wallet = mem.wallets[pendingWriterPayment.userId];
+        if (user && wallet) {
+          user.status = "active";
+          user.writerMode = pendingWriterPayment.mode;
+          wallet.registrationCredit = pendingWriterPayment.amount;
+        }
+      } else {
+        await q("UPDATE users SET status='active', writer_mode=$1 WHERE id=$2", [pendingWriterPayment.mode, pendingWriterPayment.userId]);
+        await q("UPDATE wallets SET registration_credit=$1 WHERE user_id=$2", [pendingWriterPayment.amount, pendingWriterPayment.userId]);
+      }
+      pendingWriterPayments.delete(reference);
+    }
+  }
+
+  console.log("ZetuPay webhook event:", event);
+  console.log("ZetuPay transaction:", transactionId || reference);
+
+  return res.status(200).json({ success: true, received: true, event, transactionId, reference });
+});
+
+app.post("/api/payments/zetupay/verify", auth, async (req, res) => {
+  const { reference, amount = 300 } = req.body || {};
+
+  if (!reference) {
+    return res.status(400).json({ success: false, paid: false, message: "A payment reference is required." });
+  }
+
+  const transaction = zetupayTransactions.get(reference);
+  if (transaction?.status === "paid") {
+    return res.json({
+      success: true,
+      paid: true,
+      message: "Payment verified successfully via ZetuPay webhook.",
+      amount: Number(transaction.amount || amount),
+      reference
+    });
+  }
+
+  if (!ZETUPAY_SECRET_KEY) {
+    return res.status(400).json({ success: false, paid: false, message: "ZetuPay is not configured on this backend." });
+  }
+
+  return res.status(202).json({
+    success: false,
+    paid: false,
+    message: "Payment is still being verified by ZetuPay. Wait for the webhook callback.",
+    reference
+  });
+});
+
 app.post("/api/auth/register", async (req, res) => {
   const { name, email, password, role = "student", referralCode } = req.body || {};
   if (!name || !email || !password || !["student", "writer"].includes(role)) {
@@ -225,6 +465,10 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(403).json({ error: "Your account has been banned from the platform. Please contact support." });
   }
 
+  if (user.status === "pending") {
+    return res.status(403).json({ error: "Your account is pending admin approval." });
+  }
+
   res.json({
     token: sign(user),
     user: {
@@ -259,30 +503,93 @@ app.get("/api/me", auth, async (req, res) => {
 });
 
 app.post("/api/payments/registration/demo-confirm", auth, async (req, res) => {
-  if (Number(req.body.amount) !== 300) {
-    return res.status(400).json({ error: "Registration fee is KSh 300" });
+  const amount = Number(req.body.amount);
+  if (![200, 300].includes(amount)) {
+    return res.status(400).json({ error: "Registration fee must be KSh 200 or KSh 300" });
   }
 
   if (demo) {
     const wallet = mem.wallets[req.user.id];
     if (!wallet) return res.status(404).json({ error: "Wallet not found" });
     if (wallet.registrationCredit >= 300) return res.status(409).json({ error: "Registration payment already credited" });
-    wallet.registrationCredit = 300;
+    if (wallet.registrationCredit > 0) return res.status(409).json({ error: "Registration payment already credited" });
+    wallet.registrationCredit = amount;
     const user = mem.users.find((u) => u.id === req.user.id);
     if (user) user.status = "active";
   } else {
     await q("UPDATE users SET status='active' WHERE id=$1", [req.user.id]);
     await q("UPDATE wallets SET registration_credit=300 WHERE user_id=$1", [req.user.id]);
-    await q("INSERT INTO wallet_transactions(user_id, type, amount, withdrawable, reference) VALUES($1,'registration_credit',300,false,$2)", [req.user.id, "REG-" + id()]);
+    await q("UPDATE wallets SET registration_credit=$1 WHERE user_id=$2", [amount, req.user.id]);
+    await q("INSERT INTO wallet_transactions(user_id, type, amount, withdrawable, reference) VALUES($1,'registration_credit',$2,false,$3)", [req.user.id, amount, "REG-" + id()]);
   }
 
   res.json({ message: "Registration payment confirmed. KSh 300 non-withdrawable credit applied." });
+});
+
+app.post("/api/withdrawals/request", auth, role("writer"), async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const mpesaNumber = String(req.body?.mpesaNumber || "").replace(/\s+/g, "");
+
+  if (!Number.isFinite(amount) || amount < 500) {
+    return res.status(400).json({ error: "Minimum withdrawal amount is KSh 500" });
+  }
+  if (!/^\+?\d{10,15}$/.test(mpesaNumber)) {
+    return res.status(400).json({ error: "A valid M-Pesa phone number is required" });
+  }
+
+  if (demo) {
+    const wallet = mem.wallets[req.user.id];
+    if (!wallet) return res.status(404).json({ error: "Wallet not found" });
+    if (amount > Number(wallet.withdrawableBalance || 0)) {
+      return res.status(400).json({ error: "Withdrawal amount exceeds your withdrawable balance" });
+    }
+
+    wallet.withdrawableBalance -= amount;
+    mem.withdrawals.unshift({
+      id: id(),
+      userId: req.user.id,
+      amount,
+      mpesaNumber,
+      status: "pending",
+      createdAt: new Date().toISOString()
+    });
+    return res.status(201).json({ message: "Withdrawal request submitted successfully", status: "pending" });
+  }
+
+  const wallet = (await q("SELECT withdrawable_balance AS \"withdrawableBalance\" FROM wallets WHERE user_id=$1", [req.user.id]))[0];
+  if (!wallet) return res.status(404).json({ error: "Wallet not found" });
+  if (amount > Number(wallet.withdrawableBalance || 0)) {
+    return res.status(400).json({ error: "Withdrawal amount exceeds your withdrawable balance" });
+  }
+
+  const rows = await q(
+    `WITH updated_wallet AS (
+      UPDATE wallets
+      SET withdrawable_balance = withdrawable_balance - $1
+      WHERE user_id=$2 AND withdrawable_balance >= $1
+      RETURNING user_id
+    )
+    INSERT INTO withdrawals(user_id, amount, mpesa_number)
+    SELECT user_id, $1, $3 FROM updated_wallet
+    RETURNING id, amount, status, created_at AS "createdAt"`,
+    [amount, req.user.id, mpesaNumber]
+  );
+
+  if (rows.length === 0) return res.status(409).json({ error: "Withdrawal balance changed. Please try again" });
+  res.status(201).json({ message: "Withdrawal request submitted successfully", withdrawal: rows[0] });
 });
 
 app.post("/api/writer/mode", auth, role("writer"), async (req, res) => {
   const { mode } = req.body || {};
   if (!["public", "private"].includes(mode)) {
     return res.status(400).json({ error: "Mode must be 'public' or 'private'" });
+  }
+
+  const wallet = demo
+    ? mem.wallets[req.user.id]
+    : (await q("SELECT registration_credit AS \"registrationCredit\" FROM wallets WHERE user_id=$1", [req.user.id]))[0];
+  if (!wallet || Number(wallet.registrationCredit || 0) <= 0) {
+    return res.status(402).json({ error: "Complete and confirm your registration payment before selecting a writer mode" });
   }
 
   if (demo) {
@@ -685,8 +992,36 @@ app.get("/api/admin/students", auth, role("admin"), async (req, res) => {
   res.json(rows);
 });
 
+app.post("/api/admin/student/:id/status", auth, role("admin"), async (req, res) => {
+  const { status } = req.body || {};
+  if (!status || !["active", "rejected", "banned"].includes(status)) {
+    return res.status(400).json({ error: "Invalid student status" });
+  }
+
+  if (demo) {
+    const student = mem.users.find((u) => u.id === req.params.id && u.role === "student");
+    if (!student) return res.status(404).json({ error: "Student not found" });
+    student.status = status;
+    return res.json({ message: `Student status updated to ${status}`, student });
+  }
+
+  const rows = await q(
+    "UPDATE users SET status=$1 WHERE id=$2 AND role='student' RETURNING id, name, email, status",
+    [status, req.params.id]
+  );
+  if (rows.length === 0) return res.status(404).json({ error: "Student not found" });
+  res.json({ message: `Student status updated to ${status}`, student: rows[0] });
+});
+
 app.get("/api/admin/withdrawals", auth, role("admin"), async (req, res) => {
-  if (demo) return res.json([]);
+  if (demo) {
+    return res.json(mem.withdrawals
+      .map((withdrawal) => {
+        const user = mem.users.find((item) => item.id === withdrawal.userId);
+        return { ...withdrawal, name: user?.name || "Unknown", email: user?.email || null };
+      })
+      .filter((withdrawal) => withdrawal.status === "pending"));
+  }
   const rows = await q(`
     SELECT w.id, w.user_id, u.name, u.email, w.amount, w.status, w.created_at
     FROM withdrawals w
@@ -1008,10 +1343,6 @@ app.post("/api/admin/ban-client", auth, role("admin"), async (req, res) => {
     client: rows[0]
   });
 });
-
-if (!demo) {
-  await ensureDefaultAccounts();
-}
 
 app.use((err, req, res, next) => {
   console.error(err);
