@@ -712,8 +712,8 @@ function App() {
   if (me.user.status === "pending") {
     if (me.user.role === "writer") {
       return <WriterModeSelection
-        onPublic={() => setWriterMode("public")}
-        onPrivate={() => setWriterMode("private")}
+        onPublic={() => openWriterPaymentPrompt("public")}
+        onPrivate={() => openWriterPaymentPrompt("private")}
       />;
     }
 
